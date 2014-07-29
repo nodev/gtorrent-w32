@@ -7,15 +7,16 @@ class OpenFileDialog
 public:
 	OpenFileDialog(void);
 
-	TCHAR*DefaultExtension;
-	TCHAR*FileName;
-	TCHAR*Filter;
+	TCHAR* DefaultExtension;
+	TCHAR* FileName;
+	TCHAR* Filter;
 	int FilterIndex;
 	int Flags;
-	TCHAR*InitialDir;
+	TCHAR* InitialDir;
 	HWND Owner;
-	TCHAR*Title;
+	TCHAR* Title;
 
 	bool ShowDialog();
 };
 
+void GetLocalTimeString(TCHAR *pszOutTime);

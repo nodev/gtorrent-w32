@@ -36,3 +36,39 @@ bool OpenFileDialog::ShowDialog()
 
 	return true;
 }
+
+TCHAR *pszMonths[] = 
+{
+	_T("January"),
+	_T("February"),
+	_T("March"),
+	_T("April"),
+	_T("May"),
+	_T("June"),
+	_T("July"),
+	_T("August"),
+	_T("September"),
+	_T("October"),
+	_T("November"),
+	_T("December")
+};
+
+TCHAR *pszDays[] = 
+{
+	_T("Sunday"),
+	_T("Monday"),
+	_T("Tuesday"),
+	_T("Wednesday"),
+	_T("Thursday"),
+	_T("Friday"),
+	_T("Saturday")
+};
+
+void GetLocalTimeString(TCHAR *pszOutTime)
+{
+	SYSTEMTIME st;
+	GetLocalTime(&st);
+
+	_stprintf(pszOutTime, _T("%d / %d / %d, %02d:%02d:%02d"), st.wDay, st.wMonth, st.wYear, st.wHour, st.wMinute, st.wSecond);
+}
+

@@ -6,16 +6,22 @@
 name='Microsoft.Windows.Common-Controls' version='6.0.0.0' \
 processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 
+#include <stdint.h>
+#include <queue>
+
 #include "stdafx.h"
 #include "gtorrent.h"
 #include "util.h"
+#include "config.h"
 
-extern "C"
-{
-#include "gtorrent-core.h"
-}
 
 #define MAX_LOADSTRING 100
+#define NUM_COLUMNS (sizeof(pszColumnLabels) / sizeof(pszColumnLabels[0]))
+
+gtc::gt_core *gtCore = NULL;
+std::deque<TorrentInfo*> torrent_queue;
+
+bool bRunning = FALSE;
 
 // Global Variables:
 HINSTANCE hInst;								// current instance
@@ -28,6 +34,8 @@ HWND hToolBar;
 HWND hMainFrame;
 HWND hMainWindow;
 
+//static DWORD	Config.UI.VSplitter, dwSplitterH;
+
 // Forward declarations of functions included in this code module:
 ATOM				MyRegisterClass(HINSTANCE hInstance);
 BOOL				InitInstance(HINSTANCE, int);
@@ -38,6 +46,12 @@ HWND				CreateStatusTreeView(HWND hwndParent);
 HWND				CreateDetailTabView(HWND hwndParent);
 HWND				CreateToolbar(HWND hWndParent);
 HWND				CreateMainFrame(HWND hwndParent);
+VOID CALLBACK       UIUpdateCallback(HWND hWnd, UINT uMsg, UINT_PTR idEvent, DWORD dwTime);
+
+void UpdateTorrentListView(void);
+void FinalizeConfig(void);
+
+void OnAddTorrent(void);
 
 void GetWindowPos(HWND hWnd, int *x, int *y)
 {
@@ -68,12 +82,29 @@ bool IsMouseOver(HWND hWnd, int mousex, int mousey)
 
 bool InitGTCore(void)
 {
-	gt_core *g = core_create();
+	gtCore = gtc::core_create();
 
-	return (g != NULL);
+	return (gtCore != NULL);
 }
 
-#define CUSTOM_WC   _T("CustomControl")
+void CloseGTCore(void)
+{
+	if (!torrent_queue.empty())
+	{
+		for (int i = 0; i < torrent_queue.size(); i++)
+		{
+			TorrentInfo *t = torrent_queue[i];
+			free(t->pszPath);
+			free(t);
+		}
+		torrent_queue.clear();
+	}
+
+	if (gtCore)
+		gtc::core_shutdown(gtCore);
+}
+
+#define CUSTOM_FRAME   _T("CustomFrame")
 
 void CustomPaint(HWND hwnd)
 {
@@ -109,15 +140,14 @@ void CustomRegister(void)
 	wc.style = CS_GLOBALCLASS | CS_HREDRAW | CS_VREDRAW;
 	wc.lpfnWndProc = CustomProc;
 	wc.hCursor = LoadCursor(NULL, IDC_ARROW);
-	wc.lpszClassName = CUSTOM_WC;
+	wc.lpszClassName = CUSTOM_FRAME;
 	RegisterClass(&wc);
 }
 
 void CustomUnregister(void)
 {
-	UnregisterClass(CUSTOM_WC, NULL);
+	UnregisterClass(CUSTOM_FRAME, NULL);
 }
-
 
 int APIENTRY _tWinMain(_In_ HINSTANCE hInstance,
                      _In_opt_ HINSTANCE hPrevInstance,
@@ -129,10 +159,11 @@ int APIENTRY _tWinMain(_In_ HINSTANCE hInstance,
 
 	MSG msg;
 	HACCEL hAccelTable;
+	UINT_PTR timer;
 
 	if (!InitGTCore())
 	{
-		MessageBox(NULL, TEXT("Error initializing gTorrent-Core!"), TEXT("ERROR"), MB_OK);
+		MessageBox(NULL, _T("Error initializing gTorrent-Core!"), _T("ERROR"), MB_OK);
 	}
 
 	INITCOMMONCONTROLSEX icex;
@@ -141,6 +172,8 @@ int APIENTRY _tWinMain(_In_ HINSTANCE hInstance,
 	InitCommonControlsEx(&icex);
 
 	CustomRegister();
+
+	LoadConfig();
 
 	// Initialize global strings
 	LoadString(hInstance, IDS_APP_TITLE, szTitle, MAX_LOADSTRING);
@@ -155,17 +188,31 @@ int APIENTRY _tWinMain(_In_ HINSTANCE hInstance,
 
 	hAccelTable = LoadAccelerators(hInstance, MAKEINTRESOURCE(IDC_GTORRENT));
 
-	// Main message loop:
-	while (GetMessage(&msg, NULL, 0, 0))
+	timer = SetTimer(NULL, NULL, 1000, UIUpdateCallback);
+
+	while (bRunning)
 	{
-		if (!TranslateAccelerator(msg.hwnd, hAccelTable, &msg))
+		while (PeekMessage(&msg, NULL, 0, 0, PM_NOREMOVE))
 		{
-			TranslateMessage(&msg);
-			DispatchMessage(&msg);
+			GetMessage(&msg, NULL, 0, 0);
+			if (!TranslateAccelerator(msg.hwnd, hAccelTable, &msg))
+			{
+				TranslateMessage(&msg);
+				DispatchMessage(&msg);
+			}
 		}
+
+		Sleep(10);
 	}
 
+	KillTimer(NULL, timer);
+
 	CustomUnregister();
+	CloseGTCore();
+
+	// TODO: FinalizeConfig() is called within the WM_DESTROY to flush settings to the memory
+	// to save UI settings before everything is kill.
+	SaveConfig();
 
 	return (int) msg.wParam;
 }
@@ -224,6 +271,10 @@ void ResizeWindow(DWORD dwSplitterPos)
 	int x, y, w, h;
 	RECT r;
 
+	// TODO: Test this default value
+	if (dwSplitterPos == 0)
+		dwSplitterPos = 200;
+
 	GetClientRect(hMainWindow, &r);
 	x = y = 0;
 	w = dwSplitterPos - 1;
@@ -234,7 +285,7 @@ void ResizeWindow(DWORD dwSplitterPos)
 	x = dwSplitterPos + 2;
 	y = 0;
 	w = r.right - dwSplitterPos - 2;
-	h = r.bottom / 2;
+	h = (r.bottom * 2) / 3;
 	MoveWindow(hMainFrame, x, y, w, h, TRUE);
 
 	GetClientRect(hToolBar, &r);
@@ -245,11 +296,160 @@ void ResizeWindow(DWORD dwSplitterPos)
 
 	GetClientRect(hMainWindow, &r);
 	x = dwSplitterPos + 2;
-	y = (r.bottom - r.top) / 2;
+	y = ((r.bottom - r.top) * 2 ) / 3;
 	w = r.right - dwSplitterPos - 2;
-	h = r.bottom / 2;
+	h = r.bottom / 3;
 	MoveWindow(hDetailsTab, x, y, w, h, TRUE);
 	UpdateWindow(hMainWindow);
+}
+
+VOID CALLBACK UIUpdateCallback(HWND hWnd, UINT uMsg, UINT_PTR idEvent, DWORD dwTime)
+{
+	UpdateTorrentListView();
+}
+
+void FinalizeConfig(void)
+{
+	for (int i = 0; i < 9; i++)
+	{
+		Config.UI.ListView.Widths[i] = ListView_GetColumnWidth(hTorrentList, i);
+	}
+//	Config.UI.VSplitter = Config.UI.VSplitter;
+}
+
+void UpdateTorrentListView(void)
+{
+	TorrentInfo* t;
+	LVITEM		lvItem;
+
+	// TODO: Fix 64
+	TCHAR text[64];
+
+	if (torrent_queue.empty())
+		return;
+
+	for (int i = 0; i < torrent_queue.size(); i++)
+	{
+		//TODO: Columns are hardcoded for now.
+
+		t = torrent_queue[i];
+
+		if (t->t)
+		{
+			lvItem.mask = LVIF_TEXT;
+			lvItem.iItem = i;
+
+			// Name
+			lvItem.iSubItem = 1;
+			_tsplitpath(t->pszPath, NULL, NULL, text, NULL);
+			lvItem.pszText = text;
+			ListView_SetItem(hTorrentList, &lvItem);
+
+			// Size
+			lvItem.iSubItem = 2;
+			int64_t size = gtc::get_size(t->t);
+			// TODO: Sizes are shown in MBs right now
+			_stprintf(text, _T("%d MB"), size / 1024 / 1024);
+			lvItem.pszText = text;
+			ListView_SetItem(hTorrentList, &lvItem);
+
+			// Status
+			lvItem.iSubItem = 3;
+			float progress = gtc::get_total_progress(t->t);
+			_stprintf(text, _T("%3.0f %%"), progress);
+			lvItem.pszText = text;
+			ListView_SetItem(hTorrentList, &lvItem);
+
+			// Down speed
+			lvItem.iSubItem = 4;
+			uint32_t down_rate = gtc::get_download_rate(t->t);
+			_stprintf(text, _T("%d KB/s"), down_rate / 1024);
+			lvItem.pszText = text;
+			ListView_SetItem(hTorrentList, &lvItem);
+
+			// Up speed
+			lvItem.iSubItem = 5;
+			uint32_t up_rate = gtc::get_upload_rate(t->t);
+			_stprintf(text, _T("%d KB/s"), up_rate / 1024);
+			lvItem.pszText = text;
+			ListView_SetItem(hTorrentList, &lvItem);
+
+			// ETA
+			lvItem.iSubItem = 6;
+			int64_t time = gtc::get_time_remaining(t->t);
+			int h, m, s;
+			h = time / 3600;
+			time %= 3600;
+			m = time / 60;
+			time %= 60;
+			s = time;
+			_stprintf(text, _T("%d H : %d M : %d S"), h, m, s);
+			lvItem.pszText = text;
+			ListView_SetItem(hTorrentList, &lvItem);
+
+			// Seeds/peers
+			lvItem.iSubItem = 7;
+			uint32_t seeders = gtc::get_total_seeders(t->t);
+			uint32_t leechers = gtc::get_total_leechers(t->t);
+			_stprintf(text, _T("%d / %d"), seeders, leechers);
+			lvItem.pszText = text;
+			ListView_SetItem(hTorrentList, &lvItem);
+
+			// Added On
+			lvItem.iSubItem = 8;
+			lvItem.pszText = t->szDateAdded;
+			ListView_SetItem(hTorrentList, &lvItem);
+
+			// Completed On
+
+			UpdateWindow(hTorrentList);
+		}
+	}
+}
+
+void OnAddTorrent(void)
+{
+	// TODO: Do error checking
+	LVITEM		lvItem;
+	OpenFileDialog ofd;
+
+	// TODO: Fix 64
+	TCHAR text[64];
+
+	if (ofd.ShowDialog())
+	{
+		size_t len = _tcscnlen(ofd.FileName, MAX_PATH);
+		char *path = (char*)malloc(len+1);
+		wcstombs(path, ofd.FileName, len);
+		path[len] = '\0';
+
+		TorrentInfo *ti = (TorrentInfo*)malloc(sizeof(TorrentInfo));
+		ti->t = gtc::add_torrent(gtCore, path);
+		ti->pszPath = _tcsdup(ofd.FileName);
+		GetLocalTimeString(ti->szDateAdded);
+		torrent_queue.push_back(ti);
+
+		free(path);
+
+		lvItem.mask = LVIF_TEXT;
+		lvItem.iItem = (int)torrent_queue.size();
+		lvItem.iSubItem = 0;
+		_stprintf(text, _T("%d"), lvItem.iItem);
+		lvItem.pszText = text;
+		ListView_InsertItem(hTorrentList, &lvItem);
+
+		UpdateTorrentListView();
+	}
+}
+
+void OnPauseTorrent(void)
+{
+
+}
+
+void OnResumeTorrent(void)
+{
+
 }
 
 LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
@@ -261,7 +461,6 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 	static HCURSOR 	hCursorWE;
 	static HCURSOR 	hCursorNS;
 	static BOOL	bSplitterMoving;
-	static DWORD	dwSplitterV, dwSplitterH;
 	static bool bHSplitter;
 
 	switch (message)
@@ -276,8 +475,10 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 		GetClientRect(hWnd, &rect);
 
 		// Rough approximation for treeview width
-		dwSplitterV = (rect.right - rect.left) / 7;
-		dwSplitterH = (rect.bottom - rect.top) / 2;
+		Config.UI.VSplitter = (rect.right - rect.left) / 7;
+//		dwSplitterH = (rect.bottom - rect.top) / 2;
+
+		bRunning = TRUE;
 		break;
 
 	case WM_COMMAND:
@@ -294,7 +495,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 			break;
 
 		case IDM_ADD_TORRENT:
-			MessageBox(hWnd, TEXT("Add torrent!"), TEXT("Add"), MB_OK);
+			OnAddTorrent();
 			break;
 		default:
 			return DefWindowProc(hWnd, message, wParam, lParam);
@@ -302,7 +503,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 		break;
 
 	case WM_SIZE:
-		ResizeWindow(dwSplitterV);
+		ResizeWindow(Config.UI.VSplitter);
 		break;
 
 	case WM_MOUSEMOVE:
@@ -319,7 +520,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 				if (LOWORD(lParam) > rect.right)
 					return 0;
 
-				dwSplitterV = LOWORD(lParam);
+				Config.UI.VSplitter = LOWORD(lParam);
 				SendMessage(hWnd, WM_SIZE, 0, MAKELPARAM(rect.right, rect.bottom));
 			}
 		}
@@ -348,7 +549,6 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 		}
 		break;
 
-
 	case WM_LBUTTONUP:
 		ReleaseCapture();
 		bSplitterMoving = FALSE;
@@ -359,6 +559,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 		EndPaint(hWnd, &ps);
 		break;
 	case WM_DESTROY:
+		bRunning = FALSE;
+		FinalizeConfig();
 		PostQuitMessage(0);
 		break;
 	default:
@@ -389,16 +591,16 @@ INT_PTR CALLBACK About(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam)
 
 TCHAR *pszColumnLabels[] =
 {
-	TEXT("Number"),
-	TEXT("Name"),
-	TEXT("Size"),
-	TEXT("Status"),
-	TEXT("Down Speed"),
-	TEXT("Up Speed"),
-	TEXT("ETA"),
-	TEXT("Seeds/Peers"),
-	TEXT("Added"),
-	TEXT("Completed On")
+	_T("Number"),
+	_T("Name"),
+	_T("Size"),
+	_T("Status"),
+	_T("Down Speed"),
+	_T("Up Speed"),
+	_T("ETA"),
+	_T("Seeds/Peers"),
+	_T("Added"),
+	_T("Completed On")
 };
 
 HWND CreateMainFrame(HWND hwndParent)
@@ -407,7 +609,7 @@ HWND CreateMainFrame(HWND hwndParent)
 
 	GetClientRect(hwndParent, &rcClient);
 
-	HWND hGroupBox = CreateWindow(CUSTOM_WC, L"",
+	HWND hGroupBox = CreateWindow(CUSTOM_FRAME, _T(""),
 		WS_CHILD | WS_VISIBLE,
 		(rcClient.right - rcClient.left) / 2,
 		0,
@@ -430,7 +632,7 @@ HWND CreateTorrentListView(HWND hwndParent)
 
 	// Create the list-view window in report view with label editing enabled.
 	HWND hWndListView = CreateWindow(WC_LISTVIEW,
-		TEXT(""),
+		_T(""),
 		WS_CHILD | LVS_REPORT | LVS_EDITLABELS | WS_VISIBLE,
 		0,
 		iHeight,
@@ -450,15 +652,20 @@ HWND CreateTorrentListView(HWND hwndParent)
 	lvColumn.mask = LVCF_FMT | LVCF_WIDTH | LVCF_TEXT /*| LVCF_SUBITEM*/;
 	lvColumn.fmt = LVCFMT_LEFT;
 
-	for (int i = 0; i < (sizeof(pszColumnLabels) / sizeof(pszColumnLabels[0])); i++)
+	for (int i = 0; i < NUM_COLUMNS; i++)
 	{
 		lvColumn.pszText = pszColumnLabels[i];
 		ListView_InsertColumn(hWndListView, i, &lvColumn);
-		ListView_SetColumnWidth(hWndListView, i, LVSCW_AUTOSIZE_USEHEADER);
+		if (Config.UI.ListView.Widths[i])
+			ListView_SetColumnWidth(hWndListView, i, Config.UI.ListView.Widths[i]);
+		else
+			ListView_SetColumnWidth(hWndListView, i, LVSCW_AUTOSIZE_USEHEADER);
 	}
 
 	// This is a hack to avoid first column taking all the width
-	ListView_SetColumnWidth(hWndListView, 0, LVSCW_AUTOSIZE_USEHEADER);
+	//TODO : 0 index is fixed for name
+	if (Config.UI.ListView.Widths[0] == 0)
+		ListView_SetColumnWidth(hWndListView, 0, LVSCW_AUTOSIZE_USEHEADER);
 
 	ListView_SetExtendedListViewStyle(hWndListView, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
 
@@ -467,11 +674,11 @@ HWND CreateTorrentListView(HWND hwndParent)
 
 TCHAR *pszStatusTreeLables[] =
 {
-	TEXT("Downloading"),
-	TEXT("Seeding"),
-	TEXT("Completed"),
-	TEXT("Active"),
-	TEXT("Inactive")
+	_T("Downloading"),
+	_T("Seeding"),
+	_T("Completed"),
+	_T("Active"),
+	_T("Inactive")
 };
 
 HWND CreateStatusTreeView(HWND hwndParent)
@@ -481,7 +688,7 @@ HWND CreateStatusTreeView(HWND hwndParent)
 
 	GetClientRect(hwndParent, &rcClient);
 	hwndTV = CreateWindow(WC_TREEVIEW,
-		TEXT("Tree View"),
+		_T("Tree View"),
 		WS_VISIBLE | WS_CHILD | WS_BORDER | TVS_HASLINES,
 		0,
 		0,
@@ -500,7 +707,7 @@ HWND CreateStatusTreeView(HWND hwndParent)
 	tvins.hParent = TVI_ROOT;
 	tvins.hInsertAfter = TVI_FIRST;
 	tvins.item.mask = TVIF_TEXT;
-	tvins.item.pszText = TEXT("Torrents");
+	tvins.item.pszText = _T("Torrents");
 
 	parent = TreeView_InsertItem(hwndTV, &tvins);
 
@@ -520,13 +727,13 @@ HWND CreateStatusTreeView(HWND hwndParent)
 
 TCHAR *pszTabLabels[] =
 {
-	TEXT("Files"),
-	TEXT("Info"),
-	TEXT("Peers"),
-	TEXT("Trackers"),
-	TEXT("Pieces"),
-	TEXT("Speed"),
-	TEXT("Logger")
+	_T("Files"),
+	_T("Info"),
+	_T("Peers"),
+	_T("Trackers"),
+	_T("Pieces"),
+	_T("Speed"),
+	_T("Logger")
 };
 
 HWND CreateDetailTabView(HWND hwndParent)
@@ -537,7 +744,7 @@ HWND CreateDetailTabView(HWND hwndParent)
 
 	GetClientRect(hwndParent, &rcClient);
 
-	hwndTab = CreateWindow(WC_TABCONTROL, TEXT(""),
+	hwndTab = CreateWindow(WC_TABCONTROL, _T(""),
 		WS_CHILD | WS_VISIBLE,
 		(rcClient.right - rcClient.left) / 2,
 		(rcClient.bottom - rcClient.top) / 2,
